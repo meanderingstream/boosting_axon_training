@@ -1,0 +1,301 @@
+# Training Loop with 5 by 1 epoch
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.7"},
+  {:axon, "~> 0.6"},
+  {:exla, "~> 0.7"},
+  {:req, "~> 0.5"},
+  {:scidata, "~> 0.1"},
+  {:nx_image, "~> 0.1"},
+  {:kino, "~> 0.13"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:longwingex, path: "/home/ml2/code/elixir/ai/libs/longwingex"}
+])
+```
+
+## Introduction
+
+This livebook is inspired by the Classifying handwritten digits notebook in the Axon documentation.  FashionMNIST was designed as a drop-in replacment for the MNIST dataset.  Instead of digits, there a grey scale images of clothing types.  Like MNIST, there are 10 kinds of images.  FashionMNIST was designed as a harder problem than the digits dataset.  You can check the difficulty by running this notebook for 10 epochs.  Notice the training accuracy will be lower than the corresponding MNIST notebook when using the exact same model and epochs.
+
+## State of the Art
+
+In a December tweet, Jeremy Howard created a challenge for the machine learning community.  Can anyone beat his accuracy in 5, 20 or 50 epochs. The challenge's epoch accuracy approach is open to the community and inclusive because the compute requirements are broader.  It doesn't matter whether you are running on an NVidia 1060, 4080, or some GPU in the cloud.  In fact, because the problem is small enough, you can even use your CPU and patience.  A CPU cloud resource can be used on a free Huggingface Space or Fly.io.  If you only have a CPU, be sure to use the EXLA or TorchX backends because they are faster than the pure Elixir default.
+
+<!-- livebook:{"break_markdown":true} -->
+
+One implied rule that isn't written in Jeremy's challenge, the model must be trained using only the original FashionMNIST training dataset.  Participants can't add any extra images to the training set.  For example, you can't use generative AI to create new fashion training data images.
+
+<!-- livebook:{"break_markdown":true} -->
+
+Leaderboard (Accuracy) on 12/15/2022
+
+* 5 Epochs - 92.7%
+* 20 Epochs - 93.2%
+
+<!-- livebook:{"break_markdown":true} -->
+
+Using Axon, we should be able to match those mid December numbers.  The techniques that Jeremy used can be built in the Nx family of libraries. The foundations for the necessary tools and techniques are in the Axon, Nx, Kino, and NxImage libraries.  Going through training resources, and hints I'll provide, should allow participants to improve the score. Try implementing one techique and share your results.  If you improve the accuracy, I'll add you to the leaderboard.  I'll also keep track of everyone who has been on the leaderboard.
+
+By competing with each other and sharing, we'll all learn the best techniques for building a State of the Art model in Elixir.  Also, I strongly recommend sharing techniques that you try that don't improve the leaderboard.  If you try something, you learn something.  When you share, everyone learns something.
+
+If we can match the numbers, then we might be able to get close to the current [leaderboard](https://forums.fast.ai/t/a-challenge-for-you-all/102656).  But let's try the 12/15 leaderboard first.
+
+## Notebook library: Show tensor data
+
+Simple image visualizer for development use.  Assumes a single image with data prepared for training.  It is most useful for displaying small image data, like 28 x 28.  The multiplier blows up the image with resizing.
+
+```elixir
+defmodule Show do
+  def show_image(img, multiplier) do
+    {x, y, _value} = Nx.shape(img)
+    
+    Nx.multiply(img, 255)
+    |> Nx.as_type(:u8)
+    |> NxImage.resize({x * multiplier, y * multiplier}, method: :nearest)
+    |> Kino.Image.new()
+  end
+end
+```
+
+## Retrieve and Prepare Data
+
+```elixir
+{train_images, train_labels} = Scidata.FashionMNIST.download()
+```
+
+```elixir
+{trn_data, trn_type, shape} = train_images
+```
+
+```elixir
+train_data =
+  trn_data
+  |> Nx.from_binary(trn_type)
+  |> Nx.reshape({:auto, 28, 28, 1})
+  |> Nx.divide(255)
+```
+
+```elixir
+# One-hot-encode and batch labels
+{labels_binary, labels_type, _shape} = train_labels
+
+label_data =
+  labels_binary
+  |> Nx.from_binary(labels_type)
+  |> Nx.new_axis(-1)
+  |> Nx.equal(Nx.tensor(Enum.to_list(0..9)))
+```
+
+## Hyperparameters
+
+```elixir
+hyperparams = %{
+  epochs: 5,
+  batch_size: 16,
+  key_init: 372,
+  dataset_size: 60_000,
+  bbox_copy_hyperparams: %{
+    box_percent: 0.2,
+    max_boxes: 4,
+    probability: 0.6
+  },
+  crop: %{
+    padding: 1,
+    probability: 0.8
+  },
+  flip: %{
+    axis: 2,
+    probability: 0.25
+  }
+}
+```
+
+## Model
+
+```elixir
+model =
+  Axon.input("features")
+  |> Axon.conv(32, kernel_size: {3, 3}, padding: :same, activation: :relu)
+  |> Axon.max_pool(kernel_size: 2)
+  |> Axon.conv(64, kernel_size: {3, 3}, padding: :same, activation: :relu)
+  |> Axon.max_pool(kernel_size: 2)
+  |> Axon.flatten()
+  |> Axon.dense(128, activation: :relu)
+  |> Axon.dense(10, activation: :softmax)
+```
+
+## Data Stream
+
+```elixir
+batch_img_stream = 
+  train_data
+  |> Nx.to_batched(hyperparams.batch_size)
+```
+
+```elixir
+batch_label_stream = 
+  label_data
+  |> Nx.to_batched(hyperparams.batch_size)
+```
+
+```elixir
+batched_stream = Stream.zip([batch_img_stream, batch_label_stream])
+```
+
+## Batch Capable Image Augmentation
+
+This notebook includes the following augmentation capabilities from the Longwingex.Augment library.
+
+## Bounding Box Copy
+
+Copies random number of bounding boxes of pixels from one location to another location in the image.  The number of boxes are determined by max_boxes, integer. The size of the boxes are determined by a box_percent
+of the image size, 0.0 to 1.0.  The probability the augmentation will be used is determined by the probability, float: 0.0 to 1.0.
+
+## Crop
+
+Create a padded border around the image and then shifts the originalimage slightly.
+Finally, a box equivalent to original image size is returned from the shifted image.
+
+## Horizontal Flip
+
+Horizontally flips the image.
+
+## Stream of augmentations
+
+These augmentations build upon each other.
+
+```elixir
+augmented_img_stream =
+  Longwingex.Augment.add_random_key_to_stream(batch_img_stream, batch_label_stream, 
+    hyperparams.dataset_size, hyperparams.batch_size, hyperparams.key_init)
+  |> Stream.map(fn(batch) ->
+    Longwingex.Augment.Vision.copy_bboxes(batch, 
+      hyperparams.bbox_copy_hyperparams.box_percent,
+      hyperparams.bbox_copy_hyperparams.max_boxes,
+      hyperparams.bbox_copy_hyperparams.probability)
+    |>  Longwingex.Augment.Vision.crop(
+      hyperparams.crop.padding,
+      hyperparams.crop.probability
+    )
+    |> Longwingex.Augment.Vision.horizontal_flip( 
+      hyperparams.flip.axis,
+      hyperparams.flip.probability) 
+    |> Longwingex.Augment.remove_random_key_from_stream()
+  end)
+
+```
+
+```elixir
+first_row =
+  augmented_img_stream
+  |> Enum.take(1)
+```
+
+```elixir
+[{aug_img_tensor, label_tensor}]= first_row
+
+```
+
+```elixir
+Show.show_image(Nx.take(aug_img_tensor, 0), 8)
+```
+
+```elixir
+Show.show_image(Nx.take(aug_img_tensor, 1), 8)
+```
+
+```elixir
+Show.show_image(Nx.take(aug_img_tensor, 2), 8)
+```
+
+```elixir
+Show.show_image(Nx.take(aug_img_tensor, 3), 8)
+```
+
+```elixir
+[first_orig_img_tensor] =
+  batch_img_stream
+  |> Enum.take(1)
+```
+
+```elixir
+Show.show_image(Nx.take(first_orig_img_tensor, 0), 8)
+```
+
+```elixir
+Show.show_image(Nx.take(first_orig_img_tensor, 1), 8)
+```
+
+```elixir
+Show.show_image(Nx.take(first_orig_img_tensor, 2), 8)
+```
+
+## Training Loop with Augmentation
+
+```elixir
+trained_model_params_with_aug =
+  model
+  |> Axon.Loop.trainer(:categorical_cross_entropy, :adam)
+  |> Axon.Loop.metric(:accuracy, "Accuracy")
+  |> Axon.Loop.run(augmented_img_stream, %{},
+    # epochs: hyperparams[:epochs],
+    epochs: 1,
+    compiler: EXLA
+  )
+```
+
+## Comparison with the test data leaderboard
+
+Now that we have the trained model parameters from the training effort, we can use them for calculating test data accuracy.
+
+Let's get the test data.
+
+```elixir
+{test_images, test_labels} = Scidata.FashionMNIST.download_test()
+```
+
+```elixir
+{test_images_binary, test_images_type, test_images_shape} = test_images
+
+test_batched_images =
+  test_images_binary
+  |> Nx.from_binary(test_images_type)
+  |> Nx.reshape(test_images_shape)
+  |> Nx.divide(255)
+  |> Nx.to_batched(hyperparams[:batch_size])
+```
+
+```elixir
+# One-hot-encode and batch labels
+{test_labels_binary, _test_labels_type, _shape} = test_labels
+
+test_batched_labels =
+  test_labels_binary
+  |> Nx.from_binary(labels_type)
+  |> Nx.new_axis(-1)
+  |> Nx.equal(Nx.tensor(Enum.to_list(0..9)))
+  |> Nx.to_batched(hyperparams[:batch_size])
+```
+
+Instead of Axon.predict, we'll use Axon.loop.evaluator with an accuracy metric.
+
+<!-- livebook:{"break_markdown":true} -->
+
+ElixirFashionMLChallenge Leaderboard (Accuracy) on 7/30/2023
+
+5 Epochs - 87.4%
+
+20 Epochs - 87.7%
+
+50 Epochs - 87.8%
+
+```elixir
+Axon.Loop.evaluator(model)
+|> Axon.Loop.metric(:accuracy, "Accuracy")
+|> Axon.Loop.run(
+  Stream.zip(test_batched_images, test_batched_labels),
+  trained_model_params_with_aug,
+  compiler: EXLA
+)
+```
