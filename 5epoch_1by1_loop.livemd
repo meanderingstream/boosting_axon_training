@@ -1,4 +1,4 @@
-# Training Loop with 5 by 1 epoch
+# Training Loop with 5 epochs 1x1 loops
 
 ```elixir
 Mix.install([
@@ -10,7 +10,8 @@ Mix.install([
   {:nx_image, "~> 0.1"},
   {:kino, "~> 0.13"},
   {:kino_vega_lite, "~> 0.1"},
-  {:longwingex, path: "/home/ml2/code/elixir/ai/libs/longwingex"}
+  # {:longwingex, git: "https://github.com/longwingex/longwingex"}
+  {:longwingex,  path: "~/code/elixir/ai/libs/longwingex"}
 ])
 ```
 
@@ -58,6 +59,33 @@ defmodule Show do
 end
 ```
 
+## Hyperparameters
+
+Hyperparameters are special value choices controlled by the user.  Varying individual choices may influence the training process or training results.
+
+```elixir
+hyperparams = %{
+  epochs: 5,
+  batch_size: 16,
+  key_init: 372,
+  dataset_size: 60_000,
+  # dataset_size: 500,
+  bbox_copy_hyperparams: %{
+    box_percent: 0.2,
+    max_boxes: 4,
+    probability: 0.6
+  },
+  crop: %{
+    padding: 1,
+    probability: 0.8
+  },
+  flip: %{
+    axis: 2,
+    probability: 0.25
+  }
+}
+```
+
 ## Retrieve and Prepare Data
 
 ```elixir
@@ -74,6 +102,15 @@ train_data =
   |> Nx.from_binary(trn_type)
   |> Nx.reshape({:auto, 28, 28, 1})
   |> Nx.divide(255)
+  |> Nx.slice([0,0,0,0], [hyperparams.dataset_size, 28, 28,1])
+```
+
+```elixir
+Nx.shape(train_data)
+```
+
+```elixir
+Nx.shape(train_data)
 ```
 
 ```elixir
@@ -85,30 +122,11 @@ label_data =
   |> Nx.from_binary(labels_type)
   |> Nx.new_axis(-1)
   |> Nx.equal(Nx.tensor(Enum.to_list(0..9)))
+  |> Nx.slice([0,0], [hyperparams.dataset_size, 10])
 ```
 
-## Hyperparameters
-
 ```elixir
-hyperparams = %{
-  epochs: 5,
-  batch_size: 16,
-  key_init: 372,
-  dataset_size: 60_000,
-  bbox_copy_hyperparams: %{
-    box_percent: 0.2,
-    max_boxes: 4,
-    probability: 0.6
-  },
-  crop: %{
-    padding: 1,
-    probability: 0.8
-  },
-  flip: %{
-    axis: 2,
-    probability: 0.25
-  }
-}
+Nx.shape(label_data)
 ```
 
 ## Model
@@ -166,83 +184,87 @@ Horizontally flips the image.
 These augmentations build upon each other.
 
 ```elixir
-augmented_img_stream =
-  Longwingex.Augment.add_random_key_to_stream(batch_img_stream, batch_label_stream, 
-    hyperparams.dataset_size, hyperparams.batch_size, hyperparams.key_init)
-  |> Stream.map(fn(batch) ->
-    Longwingex.Augment.Vision.copy_bboxes(batch, 
-      hyperparams.bbox_copy_hyperparams.box_percent,
-      hyperparams.bbox_copy_hyperparams.max_boxes,
-      hyperparams.bbox_copy_hyperparams.probability)
-    |>  Longwingex.Augment.Vision.crop(
-      hyperparams.crop.padding,
-      hyperparams.crop.probability
+defmodule EnumTrainingOuterLoop do
+  defstruct [:model_pipeline, :data_enum, :model_state]
+  
+  def run(epochs, %EnumTrainingOuterLoop{} = data_loop) do
+    Enum.reduce(1..epochs, data_loop, fn(epoch_nbr, data_loop) ->
+      model_state = epoch(epoch_nbr, data_loop)
+      Map.put(data_loop, :model_state, model_state)
+    end)
+  end
+
+  defp epoch(epoch_nbr, %EnumTrainingOuterLoop{} = data_loop) do
+    IO.puts("epoch #{epoch_nbr}")
+    data = Enum.at(data_loop.data_enum, 0)
+    Axon.Loop.run(data_loop.model_pipeline, 
+      data, data_loop.model_state,
+        epochs: 1, compiler: EXLA
     )
-    |> Longwingex.Augment.Vision.horizontal_flip( 
-      hyperparams.flip.axis,
-      hyperparams.flip.probability) 
-    |> Longwingex.Augment.remove_random_key_from_stream()
-  end)
-
+  end
+end
 ```
 
 ```elixir
-first_row =
-  augmented_img_stream
-  |> Enum.take(1)
-```
-
-```elixir
-[{aug_img_tensor, label_tensor}]= first_row
-
-```
-
-```elixir
-Show.show_image(Nx.take(aug_img_tensor, 0), 8)
-```
-
-```elixir
-Show.show_image(Nx.take(aug_img_tensor, 1), 8)
-```
-
-```elixir
-Show.show_image(Nx.take(aug_img_tensor, 2), 8)
-```
-
-```elixir
-Show.show_image(Nx.take(aug_img_tensor, 3), 8)
-```
-
-```elixir
-[first_orig_img_tensor] =
-  batch_img_stream
-  |> Enum.take(1)
-```
-
-```elixir
-Show.show_image(Nx.take(first_orig_img_tensor, 0), 8)
-```
-
-```elixir
-Show.show_image(Nx.take(first_orig_img_tensor, 1), 8)
-```
-
-```elixir
-Show.show_image(Nx.take(first_orig_img_tensor, 2), 8)
-```
-
-## Training Loop with Augmentation
-
-```elixir
-trained_model_params_with_aug =
+model_pipeline =
   model
   |> Axon.Loop.trainer(:categorical_cross_entropy, :adam)
   |> Axon.Loop.metric(:accuracy, "Accuracy")
-  |> Axon.Loop.run(augmented_img_stream, %{},
-    # epochs: hyperparams[:epochs],
-    epochs: 1,
-    compiler: EXLA
-  )
+```
+
+```elixir
+epochs = Enum.to_list(1..hyperparams.epochs)
+random_key = Nx.Random.key(hyperparams.key_init)
+init_accumulator = {[], random_key}
+{stream_of_data_streams, _} = 
+  Enum.reduce(epochs, init_accumulator, fn(_epoch, {list_of_streams, random_key} = acc) -> 
+    augmented_img_stream =
+      Longwingex.Augment.add_random_key_to_stream(batch_img_stream, batch_label_stream, 
+        hyperparams.dataset_size, hyperparams.batch_size, random_key)
+      |> Stream.map(fn(batch) ->
+        Longwingex.Augment.Vision.copy_bboxes(batch, 
+          hyperparams.bbox_copy_hyperparams.box_percent,
+          hyperparams.bbox_copy_hyperparams.max_boxes,
+          hyperparams.bbox_copy_hyperparams.probability)
+        |>  Longwingex.Augment.Vision.crop(
+          hyperparams.crop.padding,
+          hyperparams.crop.probability
+        )
+        |> Longwingex.Augment.Vision.horizontal_flip( 
+          hyperparams.flip.axis,
+          hyperparams.flip.probability) 
+        |> Longwingex.Augment.remove_random_key_from_stream()
+      end)
+
+    {_r_value, new_random_key} = Nx.Random.uniform(elem(acc, 1))
+    {[augmented_img_stream|list_of_streams], new_random_key}
+  end)
+
+stream_of_data_streams
+|> Enum.count
+```
+
+## Training using Stream of data streams
+
+```elixir
+stream_of_data_streams
+```
+
+```elixir
+data_loop = 
+  %EnumTrainingOuterLoop{ 
+    model_pipeline: model_pipeline,
+    data_enum: stream_of_data_streams,
+    model_state: %{}
+  }
+```
+
+```elixir
+training_result = EnumTrainingOuterLoop.run(5, data_loop)
+```
+
+```elixir
+trained_model_params = training_result.model_state
 ```
 
 ## Comparison with the test data leaderboard
@@ -295,7 +317,7 @@ Axon.Loop.evaluator(model)
 |> Axon.Loop.metric(:accuracy, "Accuracy")
 |> Axon.Loop.run(
   Stream.zip(test_batched_images, test_batched_labels),
-  trained_model_params_with_aug,
+  trained_model_params,
   compiler: EXLA
 )
 ```
