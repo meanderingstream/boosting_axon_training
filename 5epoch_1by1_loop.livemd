@@ -283,7 +283,8 @@ Let's get the test data.
 test_batched_images =
   test_images_binary
   |> Nx.from_binary(test_images_type)
-  |> Nx.reshape(test_images_shape)
+  # |> Nx.reshape(test_images_shape)
+  |> Nx.reshape({:auto, 28, 28, 1})
   |> Nx.divide(255)
   |> Nx.to_batched(hyperparams[:batch_size])
 ```
